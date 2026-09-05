@@ -6,6 +6,7 @@ import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createRiffAdapter } from '../src/adapters/cli/riff.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import {
   resolveInitialPromptDelivery,
@@ -192,5 +193,224 @@ describe('initial prompt argv byte-limit fallback', () => {
       preparedArg: 'prepared',
       defer: true,
     })).toEqual({ queuedContent: 'hello' });
+  });
+});
+
+describe('OpenCode v1 initial-prompt argv byte-limit (tmux command-too-long)', () => {
+  const adapter = createOpenCodeAdapter('/usr/bin/opencode');
+
+  it('declares a conservative maxInitialPromptArgBytes budget', () => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
+  });
+
+  it('keeps short first prompts on --prompt argv (cold-start reliability)', () => {
+    const prompt = '请帮我审查这个 PR';
+    const defer = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      prompt,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    });
+    expect(defer).toBe(false);
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-oc-short',
+      resume: false,
+      initialPrompt: defer ? undefined : prompt,
+    });
+    const idx = args.indexOf('--prompt');
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe(prompt);
+    expect(args).toContain(prompt);
+
+    // Short prompt → not queued, stays on argv.
+    expect(shouldQueueInitialPrompt({
+      hasPrompt: true,
+      rpcEngineActive: false,
+      queuePrompt: false,
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      deferInitialPrompt: defer,
+    })).toBe(false);
+  });
+
+  it('routes long Chinese/multi-line routing prompts to the post-start queue, not argv', () => {
+    // Simulates a long routing/role/user prompt that would blow tmux's
+    // command-string limit (~12–16 KB on Linux + tmux 3.3a).
+    const prompt = '你是一个资深的代码审查专家。\n'.repeat(500); // ~20 KB UTF-8
+    expect(Buffer.byteLength(prompt, 'utf8')).toBeGreaterThan(8192);
+
+    const defer = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      prompt,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    });
+    expect(defer).toBe(true);
+
+    // When deferred, the worker passes undefined to buildArgs so --prompt
+    // is never added → the long text does NOT appear in tmux new-session argv.
+    const args = adapter.buildArgs({
+      sessionId: 'sess-oc-long',
+      resume: false,
+      initialPrompt: defer ? undefined : prompt,
+    });
+    expect(args).not.toContain('--prompt');
+    expect(args).not.toContain(prompt);
+
+    // Deferred → worker queues the prompt for post-start delivery.
+    expect(shouldQueueInitialPrompt({
+      hasPrompt: true,
+      rpcEngineActive: false,
+      queuePrompt: false,
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      deferInitialPrompt: defer,
+    })).toBe(true);
+  });
+
+  it('resume path defers via initialPromptArgsIgnoredOnResume regardless of prompt length', () => {
+    // On resume, OpenCode silently ignores --prompt with -s <id>. The worker
+    // routes the initial prompt through the input queue via
+    // initialPromptArgsIgnoredOnResume — this is independent of the
+    // maxInitialPromptArgBytes byte limit.
+    expect(adapter.initialPromptArgsIgnoredOnResume).toBe(true);
+
+    const shortPrompt = '继续上次的任务';
+    const longPrompt = '长'.repeat(6000);
+
+    // Even a short prompt on resume must be deferred (via the resume flag,
+    // not the byte limit). The byte-limit check is an additional fresh-only guard.
+    const shortDeferByLimit = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      prompt: shortPrompt,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    });
+    expect(shortDeferByLimit).toBe(false); // short enough for argv
+
+    const longDeferByLimit = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      prompt: longPrompt,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    });
+    expect(longDeferByLimit).toBe(true); // over-limit even on fresh
+
+    // But buildArgs on resume never receives initialPrompt (worker strips it),
+    // so the resume args never include --prompt regardless.
+    const resumeArgs = adapter.buildArgs({
+      sessionId: 'sess-oc-resume',
+      resume: true,
+      resumeSessionId: 'ses_abc123',
+      initialPrompt: undefined,
+    });
+    expect(resumeArgs).not.toContain('--prompt');
+    expect(resumeArgs).toContain('--session');
+  });
+
+  it('prompt exactly at the byte budget stays on argv (boundary is inclusive)', () => {
+    // shouldDeferInitialPromptForArgLimit uses strict `>`, so a prompt whose
+    // UTF-8 byte length equals the limit keeps legacy --prompt behavior.
+    const exactBytes = 8192;
+    // ASCII chars are 1 byte each → length === byte length.
+    const prompt = 'a'.repeat(exactBytes);
+    expect(Buffer.byteLength(prompt, 'utf8')).toBe(exactBytes);
+
+    const defer = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      prompt,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    });
+    expect(defer).toBe(false);
+
+    const oneMore = 'a'.repeat(exactBytes + 1);
+    const deferOver = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+      prompt: oneMore,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    });
+    expect(deferOver).toBe(true);
+  });
+});
+
+// Integration-level: verify that a realistic production first-round envelope
+// (assembled by buildNewTopicPrompt — botmux routing hints + skill catalog +
+// session_id + identity + user_message) flows through the adapter + worker
+// defer contract as expected.  We construct a representative envelope here
+// rather than importing buildNewTopicPrompt (which pulls in zod via
+// run-envelope.ts and breaks the vitest module graph on this machine).
+// The envelope sizes are pinned to measured production values: the routing
+// block alone is ~2.8 KB (zh) / ~3.0 KB (en), the skill catalog ~2.5 KB,
+// so a typical new topic with a short user message is ~5.8–6.2 KB.
+describe('OpenCode v1 real-envelope argv budget (production envelope → defer)', () => {
+  const adapter = createOpenCodeAdapter('/usr/bin/opencode');
+  const budget = adapter.maxInitialPromptArgBytes!;
+
+  // Construct a realistic envelope that matches the size characteristics of
+  // buildNewTopicPrompt('帮我看看这个 bug', 'sess', 'opencode').
+  // The real envelope is ~5.4–6.2 KB depending on locale; we build one at
+  // ~5.4 KB to represent the zh locale floor.
+  function buildRepresentativeEnvelope(userMessage: string): string {
+    const routingBlock = `<botmux_routing>\n${'routing hint line here\n'.repeat(120)}</botmux_routing>`;
+    const skillBlock = `<botmux_skills>\n${'skill entry line here\n'.repeat(110)}</botmux_skills>`;
+    const identityBlock = `<identity>\n  <name>Bot</name>\n  <open_id>ou_bot</open_id>\n</identity>`;
+    const sessionIdBlock = `<session_id>sess-12345678</session_id>`;
+    const userBlock = `<user_message>\n${userMessage}\n</user_message>`;
+    return [routingBlock, skillBlock, identityBlock, sessionIdBlock, userBlock].join('\n\n');
+  }
+
+  it('a typical new-topic envelope with a short user message stays on argv', () => {
+    const envelope = buildRepresentativeEnvelope('帮我看看这个 bug');
+    const envelopeBytes = Buffer.byteLength(envelope, 'utf8');
+
+    // Sanity: the envelope is non-trivial (routing + skills + identity blocks).
+    expect(envelopeBytes).toBeGreaterThan(4000);
+    // The envelope with a short user message must fit the 8 KB budget so that
+    // the PR's design intent ("short prompts stay on --prompt") holds for the
+    // main topic entry point.
+    expect(envelopeBytes).toBeLessThan(budget);
+
+    const defer = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: envelope,
+      maxInitialPromptArgBytes: budget,
+    });
+    expect(defer).toBe(false);
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-integration-1',
+      resume: false,
+      initialPrompt: defer ? undefined : envelope,
+    });
+    expect(args).toContain('--prompt');
+    expect(args).toContain(envelope);
+  });
+
+  it('a long user message that pushes the envelope over budget defers to the queue', () => {
+    const longUserMessage = '请逐行审查以下代码并给出修改建议：\n'.repeat(400);
+    const envelope = buildRepresentativeEnvelope(longUserMessage);
+    const envelopeBytes = Buffer.byteLength(envelope, 'utf8');
+    expect(envelopeBytes).toBeGreaterThan(budget);
+
+    const defer = shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: envelope,
+      maxInitialPromptArgBytes: budget,
+    });
+    expect(defer).toBe(true);
+
+    // When deferred, --prompt is never added → the long text does NOT appear
+    // in tmux new-session argv.
+    const args = adapter.buildArgs({
+      sessionId: 'sess-integration-2',
+      resume: false,
+      initialPrompt: defer ? undefined : envelope,
+    });
+    expect(args).not.toContain('--prompt');
+    expect(args).not.toContain(envelope);
+
+    expect(shouldQueueInitialPrompt({
+      hasPrompt: true,
+      rpcEngineActive: false,
+      queuePrompt: false,
+      passesInitialPromptViaArgs: true,
+      deferInitialPrompt: defer,
+    })).toBe(true);
   });
 });
